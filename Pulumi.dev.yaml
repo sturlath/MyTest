@@ -1,0 +1,5 @@
+config:
+  MyTest:dbPassword:
+    secure: PASSWORD
+  MyTest:location: North Europe
+  azure-native:location: North Europe
