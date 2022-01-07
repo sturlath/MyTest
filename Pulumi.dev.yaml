@@ -1,5 +1,18 @@
 config:
-  MyTest:dbPassword:
-    secure: PASSWORD
-  MyTest:location: North Europe
-  azure-native:location: North Europe
+  IBeinni:Authentication-Facebook-AppId:
+    secure: xxxx
+  IBeinni:Authentication-Facebook-AppSecret:
+    secure: xxxx
+  IBeinni:Payment-Rapyd-AccessKey:
+    secure: xxxx
+  IBeinni:Payment-Rapyd-SecretKey:
+    secure: xxxx
+  IBeinni:StringEncryption-DefaultPassPhrase:
+    secure: xxxx
+  IBeinni:TwilioSms-AccountSId:
+    secure: xxxx
+  IBeinni:TwilioSms-AuthToken:
+    secure: xxxx
+  IBeinni:dbPassword:
+    secure: xxxx
+  IBeinni:location: North Europe

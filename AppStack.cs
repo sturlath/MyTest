@@ -8,6 +8,7 @@ using Pulumi.Azure.KeyVault.Inputs;
 using Pulumi.Azure.Sql;
 using Pulumi.Azure.Storage;
 using Pulumi.AzureNative.Insights;
+using System;
 using System.Linq;
 using AzureNative = Pulumi.AzureNative;
 
@@ -16,19 +17,19 @@ class AppStack : Stack
     public AppStack()
     {
         Config();
+        SetupSQL();
+        SetupActiveDirectory();
         SetupStorageAccounts();
         SetupServicePlan();
-        SetKeyVault();
+        SetKeyVaultAndSecrets();
         SetupRedis();
         SetupApplicationInsights();
         SetupAzureMediaService();
-        SetupSQL();
         SetupIdentityService();
         SetupApiService();
         SetupPublicWebService();
         SetupBlazorService();
     }
-
     private void Config()
     {
         Configuration = new Config();
@@ -37,7 +38,7 @@ class AppStack : Stack
         CurrentSubscriptionId = current.Apply(current => current.Id);
         CurrentSubscriptionDisplayName = current.Apply(current => current.DisplayName);
 
-        ResourceGroup = Output.Create(new ResourceGroup("MyTest-rg", new ResourceGroupArgs
+        ResourceGroup = Output.Create(new ResourceGroup("Beinni-rg", new ResourceGroupArgs
         {
             Location = Configuration.Require("location"),
             Tags =
@@ -45,11 +46,79 @@ class AppStack : Stack
                 { "environment", StackName },
             },
         }));
+
+        var clientConfig = Output.Create(GetClientConfig.InvokeAsync());
+        CurrentPricipal = clientConfig.Apply(c => c.ObjectId);
+        TenantId = clientConfig.Apply(c => c.TenantId);
+    }
+    private void SetupSQL()
+    {
+        // Azure SQL Server that we want to access from the application
+        SqlServer = new SqlServer("sqlserverbeinni", new SqlServerArgs
+        {
+            ResourceGroupName = ResourceGroup.Apply(t => t.Name),
+            // The login and password are required but won't be used in our application
+            AdministratorLogin = "manualadmin",
+            AdministratorLoginPassword = Configuration.RequireSecret("dbPassword"),
+            Version = "12.0",
+            Tags =
+            {
+                { "environment", StackName },
+            },
+        });
+
+        // Azure SQL Database that we want to access from the application
+        Database = new Database("beinni_db", new DatabaseArgs
+        {
+            ResourceGroupName = ResourceGroup.Apply(t => t.Name),
+            ServerName = SqlServer.Name,
+            RequestedServiceObjectiveName = "S0", //Standard 10GB
+            Tags =
+            {
+                { "environment", StackName },
+            },
+        }
+        , new CustomResourceOptions
+        {
+            // Please note that the imported resources are marked as protected. To destroy them
+            // you will need to remove the `protect` option and run `pulumi update` *before*
+            // the destroy will take effect.
+            //Protect = true,
+        }
+        );
+
+        // The connection string that has no credentials in it: authertication will come through MSI
+        ConnectionString = Output.Create($"Server=tcp:{SqlServer.Name}.database.windows.net;Database={Database.Name};").Apply(c => c);
+        //ConnectionString =  Output.Format($"Server=tcp:{SqlServer.Name}.database.windows.net;Database={Database.Name};");
+    }
+    private void SetupActiveDirectory()
+    {
+        // This code got created when I ran the following command
+        //pulumi import azure-native:sql:ServerAzureADAdministrator activeDirectory /subscriptions/0e96528a-9029-46fc-b37c-b313473b5ae5/resourceGroups/beinni-rg42d3b5aa/providers/Microsoft.Sql/servers/beinnisqlserveree7348a/administrators/ActiveDirectory
+
+        var activeDirectory = new AzureNative.Sql.ServerAzureADAdministrator("activeDirectory", new AzureNative.Sql.ServerAzureADAdministratorArgs
+        {
+            AdministratorName = "ActiveDirectory",
+            AdministratorType = "ActiveDirectory",
+            Login = "adadmin",
+            ResourceGroupName = ResourceGroup.Apply(t => t.Name),
+            ServerName = SqlServer.Name,
+            Sid = "d4aee8f4-2aa3-42cf-b6b0-1260b11516d7",
+            TenantId = CurrentPricipal,
+        }
+        , new CustomResourceOptions
+        {
+            // Please note that the imported resources are marked as protected. To destroy them
+            // you will need to remove the `protect` option and run `pulumi update` *before*
+            // the destroy will take effect.
+            //Protect = true,
+        }
+        );
     }
     private void SetupStorageAccounts()
     {
         // Create a storage account for Blobs (uploads and posters)
-        var storageAccount = new Account("myteststorage", new AccountArgs
+        var storageAccount = new Account("storage", new AccountArgs
         {
             ResourceGroupName = ResourceGroup.Apply(t => t.Name),
             AccountReplicationType = "LRS",
@@ -66,7 +135,7 @@ class AppStack : Stack
     private void SetupServicePlan()
     {
         // A plan to host the App Service
-        AppServicePlan = Output.Create(new Plan("MyTest-sp", new PlanArgs
+        AppServicePlan = new Plan("Beinni-sp", new PlanArgs
         {
             ResourceGroupName = ResourceGroup.Apply(t => t.Name),
             Kind = "App",
@@ -79,16 +148,12 @@ class AppStack : Stack
             {
                 { "environment", StackName },
             },
-        }));
+        });
     }
-    private void SetKeyVault()
+    private void SetKeyVaultAndSecrets()
     {
-        var clientConfig = Output.Create(GetClientConfig.InvokeAsync());
-        var currentPrincipal = clientConfig.Apply(c => c.ObjectId);
-        TenantId = clientConfig.Apply(c => c.TenantId);
-
         // Key Vault to store secrets
-        KeyVault = Output.Create(new KeyVault("vault", new KeyVaultArgs
+        KeyVault = new KeyVault("vault", new KeyVaultArgs
         {
             ResourceGroupName = ResourceGroup.Apply(t => t.Name),
             SkuName = "standard",
@@ -100,7 +165,7 @@ class AppStack : Stack
                     TenantId = TenantId,
                     // The current principal has to be granted permissions to Key Vault so that it can actually add and then remove
                     // secrets to/from the Key Vault. Otherwise, 'pulumi up' and 'pulumi destroy' operations will fail.
-                    ObjectId = currentPrincipal,
+                    ObjectId = CurrentPricipal,
                     SecretPermissions = {"delete", "get", "list", "set"},
                 }
             },
@@ -108,44 +173,116 @@ class AppStack : Stack
             {
                 { "environment", StackName },
             },
-        }));
+        });
+
+        var connectionStringSecret = new Secret("ConnectionString", new SecretArgs
+        {
+            KeyVaultId = KeyVault.Id,
+            Value = Output.Format($"Server=tcp:{SqlServer.Name}.database.windows.net;Database={Database.Name};"),
+        });
+
+        #region Encryption
+        var stringEncryptionDefaultPassPhraseSecret = new Secret("DefaultPassPhrase", new SecretArgs
+        {
+            KeyVaultId = KeyVault.Id,
+            Value = Configuration.RequireSecret("StringEncryption-DefaultPassPhrase"),
+        });
+
+        #endregion
+
+        #region Rapyd
+        var paymentRapydSecretKeySecret = new Secret("Rapyd-SecretKey", new SecretArgs
+        {
+            KeyVaultId = KeyVault.Id,
+            Value = Configuration.RequireSecret("Payment-Rapyd-SecretKey"),
+        });
+
+        var paymentRapydAccessKeySecret = new Secret("Rapyd-AccessKey", new SecretArgs
+        {
+            KeyVaultId = KeyVault.Id,
+            Value = Configuration.RequireSecret("Payment-Rapyd-AccessKey"),
+        });
+        #endregion
+
+        #region Twilio
+        var twilioSms_AccountSIdSecret = new Secret("Twilio-AccountSId", new SecretArgs
+        {
+            KeyVaultId = KeyVault.Id,
+            Value = Configuration.RequireSecret("TwilioSms-AccountSId"),
+        });
+
+        var twilioSms_AuthTokenSecret = new Secret("Twilio-AuthToken", new SecretArgs
+        {
+            KeyVaultId = KeyVault.Id,
+            Value = Configuration.RequireSecret("TwilioSms-AuthToken"),
+        });
+        #endregion
+
+        #region Facebook
+        var authentication_Facebook_AppId = new Secret("Facebook-AppId", new SecretArgs
+        {
+            KeyVaultId = KeyVault.Id,
+            Value = Configuration.RequireSecret("Authentication-Facebook-AppId"),
+        });
+
+        var authentication_Facebook_AppSecret = new Secret("FacebookAppSecret", new SecretArgs
+        {
+            KeyVaultId = KeyVault.Id,
+            Value = Configuration.RequireSecret("Authentication-Facebook-AppSecret"),
+        });
+        #endregion
+
+        ConnectionStringSecretUri = Output.Format($"{KeyVault.VaultUri}secrets/{connectionStringSecret.Name}/{connectionStringSecret.Version}");
+        DefaultEncryptionPassPhraseUri = Output.Format($"{KeyVault.VaultUri}secrets/{stringEncryptionDefaultPassPhraseSecret.Name}/{stringEncryptionDefaultPassPhraseSecret.Version}");
+        RapydSecretKeyUri = Output.Format($"{KeyVault.VaultUri}secrets/{paymentRapydSecretKeySecret.Name}/{paymentRapydSecretKeySecret.Version}");
+        RapydAccessKeyUri = Output.Format($"{KeyVault.VaultUri}secrets/{paymentRapydAccessKeySecret.Name}/{paymentRapydAccessKeySecret.Version}");
+        TwilioSmsAccountSIdUri = Output.Format($"{KeyVault.VaultUri}secrets/{twilioSms_AccountSIdSecret.Name}/{twilioSms_AccountSIdSecret.Version}");
+        TwilioSmsAuthTokenUri = Output.Format($"{KeyVault.VaultUri}secrets/{twilioSms_AuthTokenSecret.Name}/{twilioSms_AuthTokenSecret.Version}");
+        FacebookAppIdUri = Output.Format($"{KeyVault.VaultUri}secrets/{authentication_Facebook_AppId.Name}/{authentication_Facebook_AppId.Version}");
+        FacebookAppSecret = Output.Format($"{KeyVault.VaultUri}secrets/{authentication_Facebook_AppSecret.Name}/{authentication_Facebook_AppSecret.Version}");
     }
     private void SetupRedis()
     {
-        var redis = new AzureNative.Cache.Redis("mytestredis", new AzureNative.Cache.RedisArgs
+        if (Deployment.Instance.StackName.ToLower() == "dev") //<<-- not sure if you should do this!
         {
-            EnableNonSslPort = true,
-            Location = ResourceGroup.Apply(t => t.Location),
-            MinimumTlsVersion = "1.2",
-            Name = "cache1",
-            RedisConfiguration = new AzureNative.Cache.Inputs.RedisCommonPropertiesRedisConfigurationArgs
+            Redis = new AzureNative.Cache.Redis("redisCacheBeinni", new AzureNative.Cache.RedisArgs
             {
-                MaxmemoryPolicy = "allkeys-lru",
-            },
-            ReplicasPerMaster = 2,
-            ResourceGroupName = ResourceGroup.Apply(t => t.Name),
-            ShardCount = 2,
-            Sku = new AzureNative.Cache.Inputs.SkuArgs
-            {
-                Capacity = 1,
-                Family = "P",
-                Name = "Premium",
-            },
-            //StaticIP = "192.168.0.5",
-            //SubnetId = $"/subscriptions/{CurrentSubscriptionId}/resourceGroups/{ResourceGroup.Apply(t => t.Name)}/providers/Microsoft.Network/virtualNetworks/network1/subnets/subnet1",
-            Zones =
-            {
-                "1",
-            },
-            Tags =
+                EnableNonSslPort = false,
+                Location = ResourceGroup.Apply(t => t.Location),
+                MinimumTlsVersion = "1.2",
+                RedisConfiguration = new AzureNative.Cache.Inputs.RedisCommonPropertiesRedisConfigurationArgs
+                {
+                    MaxmemoryPolicy = "allkeys-lru",
+                },
+                ResourceGroupName = ResourceGroup.Apply(t => t.Name),
+                Sku = new AzureNative.Cache.Inputs.SkuArgs
+                {
+                    Capacity = 0,
+                    Family = "C",
+                    Name = "Basic",
+                },
+                //StaticIP = "192.168.0.5",
+                //SubnetId = $"/subscriptions/{CurrentSubscriptionId}/resourceGroups/{ResourceGroup.Apply(t => t.Name)}/providers/Microsoft.Network/virtualNetworks/network1/subnets/subnet1",
+                //ReplicasPerMaster = 1,//needs premium Sku!
+                //ShardCount = 1,//needs premium Sku!
+                //Zones = //needs premium Sku!
+                //{
+                //    "1",
+                //},
+                Tags =
             {
                 { "environment", StackName },
             },
-        });
+            });
+        }
+        else
+        {
+            throw new NotImplementedException("TODO: bigger?");
+        }
     }
     private void SetupApplicationInsights()
     {
-        var appInsights = new Component("appInsights", new ComponentArgs
+        var appInsights = new Component("applicationInsights", new ComponentArgs
         {
             ApplicationType = "web",
             Location = ResourceGroup.Apply(r => r.Location),
@@ -161,8 +298,8 @@ class AppStack : Stack
     }
     private void SetupAzureMediaService()
     {
-        var mediaServiceAccountName = "MyTestmediaservice";
-        var mediaService = new AzureNative.Media.MediaService("MyTestMediaService", new AzureNative.Media.MediaServiceArgs
+        var mediaServiceAccountName = "mediaservicebeinni";
+        var mediaService = new AzureNative.Media.MediaService("mediaservicebeinni", new AzureNative.Media.MediaServiceArgs
         {
             AccountName = mediaServiceAccountName,
             Location = ResourceGroup.Apply(t => t.Location),
@@ -182,77 +319,36 @@ class AppStack : Stack
             },
         });
     }
-    private void SetupSQL()
-    {
-        // Azure SQL Server that we want to access from the application
-        var sqlServer = new SqlServer("mytestsqlserver", new SqlServerArgs
-        {
-            ResourceGroupName = ResourceGroup.Apply(t => t.Name),
-            // The login and password are required but won't be used in our application
-            AdministratorLogin = "manualadmin",
-            AdministratorLoginPassword = Configuration.RequireSecret("dbPassword"),
-            Version = "12.0",
-            Tags =
-            {
-                { "environment", StackName },
-            },
-        });
-
-        SqlServerName = Output.Create(sqlServer.Name).Apply(c => c);
-
-        // Azure SQL Database that we want to access from the application
-        var database = new Database("MyTest_db", new DatabaseArgs
-        {
-            ResourceGroupName = ResourceGroup.Apply(t => t.Name),
-            ServerName = sqlServer.Name,
-            RequestedServiceObjectiveName = "S0",
-            Tags =
-            {
-                { "environment", StackName },
-            },
-        });
-
-        // The connection string that has no credentials in it: authertication will come through MSI
-        ConnectionString = Output.Format($"Server=tcp:{sqlServer.Name}.database.windows.net;Database={database.Name};");
-
-        ConnectionStringSecret = Output.Create(new Secret("Connection-String-Secret", new SecretArgs
-        {
-            Name = "connectionStringSecret",
-            KeyVaultId = KeyVault.Apply(k => k.Id),
-            Value = ConnectionString,
-        }));
-
-    }
-
     private void SetupIdentityService()
     {
-        var paymentRapydSecretKeySecret = new Secret("Payment-Rapyd-SecretKey", new SecretArgs
-        {
-            Name = "paymentRapydSecretKey",
-            KeyVaultId = KeyVault.Apply(k => k.Id),
-            Value = "SomeTestValue...",
-        });
-        var secretUri = Output.Format($"{KeyVault.Apply(k => k.VaultUri)}secrets/{paymentRapydSecretKeySecret.Name}/{paymentRapydSecretKeySecret.Version}");
-
-        var secretConnectionStringUri = Output.Format($"{KeyVault.Apply(k => k.VaultUri)}secrets/{ConnectionStringSecret.Apply(s => s.Name)}/{ConnectionStringSecret.Apply(s => s.Version)}");
-
         // The application hosted in App Service
-        var identityApp = new AppService("MyTestIdentity", new AppServiceArgs
+        var identityApp = new AppService("IdentityService", new AppServiceArgs
         {
             ResourceGroupName = ResourceGroup.Apply(t => t.Name),
-            AppServicePlanId = AppServicePlan.Apply(t => t.Id),
+            AppServicePlanId = AppServicePlan.Id,
             // A system-assigned managed service identity to be used for authentication and authorization to the SQL Database and the Blob Storage
             Identity = new AppServiceIdentityArgs { Type = "SystemAssigned" },
-
             AppSettings =
             {
                 { "APPINSIGHTS_INSTRUMENTATIONKEY",InstrumentationKey},
                 { "APPLICATIONINSIGHTS_CONNECTION_STRING",InstrumentationKey.Apply(key => $"InstrumentationKey={key}")},
                 { "ApplicationInsightsAgent_EXTENSION_VERSION","~2"},
 
-                // The setting points directly to the KV setting
-                { "Test:Level:Key", Output.Format($"@Microsoft.KeyVault(SecretUri={secretUri})")},
-                { "ConnectionStrings:Default", Output.Format($"@Microsoft.KeyVault(SecretUri={secretConnectionStringUri})")}
+                //Abp.io 
+                { "App:SelfUrl", IdentityEndpoint},
+                { "App:HttpApiUrl", ApiEndpoint},
+                { "App:CorsOrigins", $"{PublicWebAppEndpoint},{ApiEndpoint},{BlazorEndpoint}"},
+                { "App:RedirectAllowedUrls", $"{PublicWebAppEndpoint},{BlazorEndpoint}"},
+                { "App:MVCPublicUrl", PublicWebAppEndpoint},
+                { "App:BlazorUrl", BlazorEndpoint},
+
+                { "Redis:Configuration", Redis.RedisConfiguration.Apply(c=>c.AofStorageConnectionString0)}, //TODO: Should you do it like this?
+
+                // The setting points directly to the KV setting               
+                { "Rapyd:SecretKey", Output.Format($"@Microsoft.KeyVault(SecretUri={RapydSecretKeyUri})")},
+                { "Rapyd:AccessKey", Output.Format($"@Microsoft.KeyVault(SecretUri={RapydAccessKeyUri})")},
+                { "Authentication:Facebook:AppId", Output.Format($"@Microsoft.KeyVault(SecretUri={FacebookAppIdUri})")},
+                { "Authentication:Facebook:AppSecret", Output.Format($"@Microsoft.KeyVault(SecretUri={FacebookAppSecret})")}
             },
             ConnectionStrings =
             {
@@ -262,6 +358,13 @@ class AppStack : Stack
                     Type = "SQLAzure",
                     Value = ConnectionString.Apply(c=>c),
                 },
+            },
+            SiteConfig = new AppServiceSiteConfigArgs
+            {
+                Cors = new AppServiceSiteConfigCorsArgs
+                {
+                    AllowedOrigins = $"{PublicWebAppEndpoint},{ApiEndpoint},{BlazorEndpoint}"
+                }
             },
             Tags =
             {
@@ -275,7 +378,7 @@ class AppStack : Stack
         // Grant App Service access to KV secrets
         var policy = new AccessPolicy("identity-app-policy", new AccessPolicyArgs
         {
-            KeyVaultId = KeyVault.Apply(t => t.Id),
+            KeyVaultId = KeyVault.Id,
             TenantId = TenantId,
             ObjectId = principalId,
             SecretPermissions = { "get" },
@@ -288,7 +391,7 @@ class AppStack : Stack
             TenantId = TenantId,
             ObjectId = principalId,
             Login = "adadmin",
-            ServerName = SqlServerName,
+            ServerName = SqlServer.Name,
         });
 
         // Add SQL firewall exceptions
@@ -299,7 +402,7 @@ class AppStack : Stack
                     ResourceGroupName = ResourceGroup.Apply(t => t.Name),
                     StartIpAddress = ip,
                     EndIpAddress = ip,
-                    ServerName = SqlServerName,
+                    ServerName = SqlServer.Name
                 })
             ).ToList());
 
@@ -320,10 +423,10 @@ class AppStack : Stack
         });
 
         // The application hosted in App Service
-        var apiApp = new AppService("MyTestApi", new AppServiceArgs
+        var apiApp = new AppService("ApiService", new AppServiceArgs
         {
             ResourceGroupName = ResourceGroup.Apply(t => t.Name),
-            AppServicePlanId = AppServicePlan.Apply(t => t.Id),
+            AppServicePlanId = AppServicePlan.Id,
             // A system-assigned managed service identity to be used for authentication and authorization to the SQL Database and the Blob Storage
             Identity = new AppServiceIdentityArgs { Type = "SystemAssigned" },
 
@@ -332,6 +435,21 @@ class AppStack : Stack
                 { "APPINSIGHTS_INSTRUMENTATIONKEY",InstrumentationKey},
                 { "APPLICATIONINSIGHTS_CONNECTION_STRING",InstrumentationKey.Apply(key => $"InstrumentationKey={key}")},
                 { "ApplicationInsightsAgent_EXTENSION_VERSION","~2"},
+
+                //Abp.io 
+                { "App:SelfUrl", ApiEndpoint},
+                { "App:MVCPublicUrl", PublicWebAppEndpoint},
+                { "App:BlazorUrl", BlazorEndpoint},
+                { "App:CorsOrigins", $"{PublicWebAppEndpoint},{ApiEndpoint},{BlazorEndpoint}"},
+
+                { "AuthServer:Authority", IdentityEndpoint},
+                { "Redis:Configuration", Redis.RedisConfiguration.Apply(c=>c.AofStorageConnectionString0)}, //TODO: Should you do it like this?
+
+                // The setting points directly to the KV setting   
+                { "Rapyd:SecretKey", Output.Format($"@Microsoft.KeyVault(SecretUri={RapydSecretKeyUri})")},
+                { "Rapyd:AccessKey", Output.Format($"@Microsoft.KeyVault(SecretUri={RapydAccessKeyUri})")},
+                { "AbpTwilioSms:AccountSId", Output.Format($"@Microsoft.KeyVault(SecretUri={TwilioSmsAccountSIdUri})")},
+                { "AbpTwilioSms:AuthToken", Output.Format($"@Microsoft.KeyVault(SecretUri={TwilioSmsAuthTokenUri})")}
             },
             ConnectionStrings =
             {
@@ -339,8 +457,15 @@ class AppStack : Stack
                 {
                     Name = "db",
                     Type = "SQLAzure",
-                    Value = ConnectionString.Apply(c=>c),
+                    Value = Output.Format($"@Microsoft.KeyVault(SecretUri={ConnectionStringSecretUri})"),
                 },
+            },
+            SiteConfig = new AppServiceSiteConfigArgs
+            {
+                Cors = new AppServiceSiteConfigCorsArgs
+                {
+                    AllowedOrigins = $"{PublicWebAppEndpoint},{ApiEndpoint},{BlazorEndpoint}"
+                }
             },
             Tags =
             {
@@ -354,7 +479,7 @@ class AppStack : Stack
         // Grant App Service access to KV secrets
         var policy = new AccessPolicy("api-app-policy", new AccessPolicyArgs
         {
-            KeyVaultId = KeyVault.Apply(t => t.Id),
+            KeyVaultId = KeyVault.Id,
             TenantId = TenantId,
             ObjectId = principalId,
             SecretPermissions = { "get" },
@@ -367,7 +492,7 @@ class AppStack : Stack
             TenantId = TenantId,
             ObjectId = principalId,
             Login = "adadmin",
-            ServerName = SqlServerName,
+            ServerName = SqlServer.Name,
         });
 
         // Grant access from App Service to the container in the storage
@@ -375,7 +500,7 @@ class AppStack : Stack
         {
             PrincipalId = principalId,
             Scope = Output.Format($"{StorageAccountId}/blobServices/default/containers/{posterImagesStorageContainer.Name}"),
-            RoleDefinitionName = "Poster Images Storage Blob Data Reader",
+            RoleDefinitionName = "Storage Blob Data Reader",
         });
 
         // Grant access from App Service to the container in the storage
@@ -383,7 +508,7 @@ class AppStack : Stack
         {
             PrincipalId = principalId,
             Scope = Output.Format($"{StorageAccountId}/blobServices/default/containers/{uploadedRecordingsStorageContainer.Name}"),
-            RoleDefinitionName = "Uploaded Recordings Storage Blob Data Reader",
+            RoleDefinitionName = "Storage Blob Data Reader",
         });
 
         // Add SQL firewall exceptions
@@ -394,7 +519,7 @@ class AppStack : Stack
                     ResourceGroupName = ResourceGroup.Apply(t => t.Name),
                     StartIpAddress = ip,
                     EndIpAddress = ip,
-                    ServerName = SqlServerName,
+                    ServerName = SqlServer.Name,
                 })
             ).ToList());
 
@@ -403,10 +528,10 @@ class AppStack : Stack
     private void SetupPublicWebService()
     {
         // The application hosted in App Service
-        var publicWebApp = new AppService("MyTestPublicWeb", new AppServiceArgs
+        var publicWebApp = new AppService("PublicWeb", new AppServiceArgs
         {
             ResourceGroupName = ResourceGroup.Apply(t => t.Name),
-            AppServicePlanId = AppServicePlan.Apply(t => t.Id),
+            AppServicePlanId = AppServicePlan.Id,
             // A system-assigned managed service identity to be used for authentication and authorization to the SQL Database and the Blob Storage
             Identity = new AppServiceIdentityArgs { Type = "SystemAssigned" },
 
@@ -415,16 +540,25 @@ class AppStack : Stack
                 { "APPINSIGHTS_INSTRUMENTATIONKEY",InstrumentationKey},
                 { "APPLICATIONINSIGHTS_CONNECTION_STRING",InstrumentationKey.Apply(key => $"InstrumentationKey={key}")},
                 { "ApplicationInsightsAgent_EXTENSION_VERSION","~2"},
+
+                //Abp.io 
+                { "App:SelfUrl", PublicWebAppEndpoint},
+                { "App:BlazorUrl", BlazorEndpoint},
+                { "App:CorsOrigins", $"{PublicWebAppEndpoint},{ApiEndpoint},{BlazorEndpoint}"},
+                { "RemoteServices:Default:BaseUrl", ApiEndpoint},
+                { "AuthServer:Authority", IdentityEndpoint},
+
+                { "Redis:Configuration", Redis.RedisConfiguration.Apply(c=>c.AofStorageConnectionString0)}, //TODO: Should you do it like this?
             },
-            //ConnectionStrings =
-            //{
-            //    new AppServiceConnectionStringArgs
-            //    {
-            //        Name = "db",
-            //        Type = "SQLAzure",
-            //        Value = connectionString,
-            //    },
-            //},
+            ConnectionStrings =
+            {
+                new AppServiceConnectionStringArgs
+                {
+                    Name = "db",
+                    Type = "SQLAzure",
+                    Value = Output.Format($"@Microsoft.KeyVault(SecretUri={ConnectionStringSecretUri})"),
+                },
+            },
             Tags =
             {
                 { "environment", StackName },
@@ -436,10 +570,10 @@ class AppStack : Stack
     private void SetupBlazorService()
     {
         // The application hosted in App Service
-        var blazorApp = new AppService("MyTestBlazor", new AppServiceArgs
+        var blazorApp = new AppService("Blazor", new AppServiceArgs
         {
             ResourceGroupName = ResourceGroup.Apply(t => t.Name),
-            AppServicePlanId = AppServicePlan.Apply(t => t.Id),
+            AppServicePlanId = AppServicePlan.Id,
             // A system-assigned managed service identity to be used for authentication and authorization to the SQL Database and the Blob Storage
             Identity = new AppServiceIdentityArgs { Type = "SystemAssigned" },
 
@@ -455,24 +589,33 @@ class AppStack : Stack
 
         this.BlazorEndpoint = Output.Format($"https://{blazorApp.DefaultSiteHostname}");
     }
+    public Database Database { get; set; }
+    public SqlServer SqlServer { get; set; }
+    public AzureNative.Cache.Redis Redis { get; set; }
+    public Config Configuration { get; set; }
+    public KeyVault KeyVault { get; set; }
+    public Plan AppServicePlan { get; set; }
 
-    [Output] public Output<Secret> ConnectionStringSecret { get; set; }
+    [Output] public Output<AzureNative.Sql.ServerAzureADAdministrator> ServerAzureADAdministrator { get; set; }
+    [Output] public Output<string> DefaultEncryptionPassPhraseUri { get; set; }
+    [Output] public Output<string> FacebookAppIdUri { get; set; }
+    [Output] public Output<string> FacebookAppSecret { get; set; }
+    [Output] public Output<string> TwilioSmsAccountSIdUri { get; set; }
+    [Output] public Output<string> TwilioSmsAuthTokenUri { get; set; }
+    [Output] public Output<string> RapydSecretKeyUri { get; set; }
+    [Output] public Output<string> RapydAccessKeyUri { get; set; }
     [Output] public Output<string> StackName { get; set; }
-    [Output] public Output<string> ConnectionString { get; set; } //remove this one and use ConnectionStringSecret?
-
-   public Config Configuration { get; set; }
-
+    [Output] public Output<string> CurrentPricipal { get; set; }
+    [Output] public Output<string> ConnectionString { get; set; }
+    [Output] public Output<string> ConnectionStringSecretUri { get; set; }
     [Output("currentSubscriptionId")]
     public Output<string> CurrentSubscriptionId { get; set; }
     [Output("currentSubscriptionDisplayName")]
     public Output<string> CurrentSubscriptionDisplayName { get; set; }
     [Output] public Output<string> StorageAccountId { get; set; }
     [Output] public Output<string> StorageAccountName { get; set; }
-    [Output] public Output<string> SqlServerName { get; set; }
     [Output] public Output<string> InstrumentationKey { get; set; }
-    [Output] public Output<KeyVault> KeyVault { get; set; }
     [Output] public Output<string> TenantId { get; set; }
-    [Output] public Output<Plan> AppServicePlan { get; set; }
     [Output] public Output<ResourceGroup> ResourceGroup { get; set; }
     [Output] public Output<string> IdentityEndpoint { get; set; }
     [Output] public Output<string> ApiEndpoint { get; set; }
