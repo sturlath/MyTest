@@ -94,7 +94,7 @@ class AppStack : Stack
     private void SetupActiveDirectory()
     {
         // This code got created when I ran the following command
-        //pulumi import azure-native:sql:ServerAzureADAdministrator activeDirectory /subscriptions/0e96528a-9029-46fc-b37c-b313473b5ae5/resourceGroups/beinni-rg42d3b5aa/providers/Microsoft.Sql/servers/beinnisqlserveree7348a/administrators/ActiveDirectory
+        //pulumi import azure-native:sql:ServerAzureADAdministrator activeDirectory /subscriptions/.../resourceGroups/beinni-rg42d3b5aa/providers/Microsoft.Sql/servers/beinnisqlserveree7348a/administrators/ActiveDirectory
 
         var activeDirectory = new AzureNative.Sql.ServerAzureADAdministrator("activeDirectory", new AzureNative.Sql.ServerAzureADAdministratorArgs
         {
