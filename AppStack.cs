@@ -9,6 +9,7 @@ using Pulumi.Azure.Sql;
 using Pulumi.Azure.Storage;
 using Pulumi.AzureNative.Insights;
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using AzureNative = Pulumi.AzureNative;
 
@@ -17,19 +18,25 @@ class AppStack : Stack
     public AppStack()
     {
         Config();
+        SetKeyVault();
+        SetupCertifications();
+        SetupCDN();
         SetupSQL();
         SetupActiveDirectory();
         SetupStorageAccounts();
         SetupServicePlan();
-        SetKeyVaultAndSecrets();
+        SetSecrets();
         SetupRedis();
         SetupApplicationInsights();
         SetupAzureMediaService();
+
+        // My code goes into these services!
         SetupIdentityService();
         SetupApiService();
         SetupPublicWebService();
         SetupBlazorService();
     }
+
     private void Config()
     {
         Configuration = new Config();
@@ -38,7 +45,7 @@ class AppStack : Stack
         CurrentSubscriptionId = current.Apply(current => current.Id);
         CurrentSubscriptionDisplayName = current.Apply(current => current.DisplayName);
 
-        ResourceGroup = Output.Create(new ResourceGroup("Beinni-rg", new ResourceGroupArgs
+        ResourceGroup = Output.Create(new ResourceGroup("MyProject-rg", new ResourceGroupArgs
         {
             Location = Configuration.Require("location"),
             Tags =
@@ -51,10 +58,107 @@ class AppStack : Stack
         CurrentPricipal = clientConfig.Apply(c => c.ObjectId);
         TenantId = clientConfig.Apply(c => c.TenantId);
     }
+    private void SetKeyVault()
+    {
+        // Key Vault to store secrets
+        KeyVault = new KeyVault("vault", new KeyVaultArgs
+        {
+            ResourceGroupName = ResourceGroup.Apply(t => t.Name),
+            SkuName = "standard",
+            TenantId = TenantId,
+            AccessPolicies =
+            {
+                new KeyVaultAccessPolicyArgs
+                {
+                    TenantId = TenantId,
+                    // The current principal has to be granted permissions to Key Vault so that it can actually add and then remove
+                    // secrets to/from the Key Vault. Otherwise, 'pulumi up' and 'pulumi destroy' operations will fail.
+                    ObjectId = CurrentPricipal,
+                    SecretPermissions = {"delete", "get", "list", "set"},
+                }
+            },
+            Tags =
+            {
+                { "environment", StackName },
+            },
+        });
+
+    }
+    private void SetupCertifications()
+    {
+        if (Deployment.Instance.StackName.ToLower() == "production")
+        {
+            // *.myProject.is wildcard certificate! https://www.pulumi.com/registry/packages/azure/api-docs/appservice/certificateorder/
+            CertificateOrder = new CertificateOrder("myProjectiscertificate", new CertificateOrderArgs
+            {
+                AutoRenew = true,
+                KeySize = 2048,
+                Location = "global",
+                Name = "myProjectcert",
+                ProductType = "WildCard",
+                ResourceGroupName = ResourceGroup.Apply(t => t.Name),
+                Tags =
+            {
+                { "environment", StackName },
+            },
+                ValidityInYears = 1,
+            }, new CustomResourceOptions
+            {
+                Protect = true,
+            });
+
+            //TODO: Add this CertificateOrder Certificate to KeyVault when I have my question answered.. https://pulumi-community.slack.com/archives/C84L4E3N1/p1641716620098800
+            // I imported it like this.. but is it enough? pulumi import azure:keyvault/secret:Secret CertificateOrderSecret "https://vault723aa5a.vault.azure.net/secrets/.../..."
+            var certOrderSecret = new Secret("CertOrderSecret", new SecretArgs
+            {
+                ContentType = "application/x-pkcs12",
+                //ExpirationDate = "2023-01-09T09:28:06Z", //Do we want this?
+                KeyVaultId = KeyVault.Id,
+                NotBeforeDate = "2022-01-09T09:28:06Z",
+                Tags =
+            {
+                { "CertificateId", CertificateOrder.Id },
+                { "CertificateState", "Ready" },
+                { "SerialNumber", "01D774B64A545663" },
+                { "Thumbprint", "AA410F20BD5FB1179F3473540BA71B7EBFB94160" },
+            },
+                Value = Configuration.RequireSecret("WildCardCertSecret"),
+            }, new CustomResourceOptions
+            {
+                Protect = true,
+            });
+        }
+
+        //not sure what to do with this one... was just trying it out
+        //WebCertificate = new AzureNative.Web.Certificate("webcertificate", new AzureNative.Web.CertificateArgs
+        //{
+        //    //KeyVaultId = KeyVault.Id, //This throws an error "The parameter Properties.KeyVaultId has an invalid value."! No idea why because it works everywhere else!
+        //    HostNames =
+        //    {
+        //        "ServerCert",
+        //    },
+        //    Location = "northeurope",
+        //    Name = "myProjectc4321",
+        //    Password = Configuration.RequireSecret("WebCertificate"),
+        //    ResourceGroupName = ResourceGroup.Apply(t => t.Name),
+        //});
+    }
+    private void SetupCDN()
+    {
+        CDNProfile = new AzureNative.Cdn.Profile("myProject-cdn", new AzureNative.Cdn.ProfileArgs
+        {
+            ResourceGroupName = ResourceGroup.Apply(t => t.Name),
+            Sku = new AzureNative.Cdn.Inputs.SkuArgs
+            {
+                // https://docs.microsoft.com/en-us/azure/cdn/cdn-features
+                Name = "Standard_Microsoft" //or Standard_Microsoft or Standard_Akamai
+            }
+        });
+    }
     private void SetupSQL()
     {
         // Azure SQL Server that we want to access from the application
-        SqlServer = new SqlServer("sqlserverbeinni", new SqlServerArgs
+        SqlServer = new SqlServer("sqlservermyProject", new SqlServerArgs
         {
             ResourceGroupName = ResourceGroup.Apply(t => t.Name),
             // The login and password are required but won't be used in our application
@@ -68,7 +172,7 @@ class AppStack : Stack
         });
 
         // Azure SQL Database that we want to access from the application
-        Database = new Database("beinni_db", new DatabaseArgs
+        Database = new Database("myProject_db", new DatabaseArgs
         {
             ResourceGroupName = ResourceGroup.Apply(t => t.Name),
             ServerName = SqlServer.Name,
@@ -89,12 +193,13 @@ class AppStack : Stack
 
         // The connection string that has no credentials in it: authertication will come through MSI
         ConnectionString = Output.Create($"Server=tcp:{SqlServer.Name}.database.windows.net;Database={Database.Name};").Apply(c => c);
-        //ConnectionString =  Output.Format($"Server=tcp:{SqlServer.Name}.database.windows.net;Database={Database.Name};");
+        // Connection string with password until this issue is solved https://github.com/pulumi/pulumi-azure-native/issues/1416
+        ConnectionStringWithPassword = Output.Create($"Server=tcp:{SqlServer.Name}.database.windows.net,1433;Initial Catalog={Database.Name};Persist Security Info=False;User ID=manualadmin;Password={Configuration.RequireSecret("dbPassword")};MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;").Apply(c => c);
     }
     private void SetupActiveDirectory()
     {
         // This code got created when I ran the following command
-        //pulumi import azure-native:sql:ServerAzureADAdministrator activeDirectory /subscriptions/.../resourceGroups/beinni-rg42d3b5aa/providers/Microsoft.Sql/servers/beinnisqlserveree7348a/administrators/ActiveDirectory
+        //pulumi import azure-native:sql:ServerAzureADAdministrator activeDirectory /subscriptions/.../resourceGroups/myProject-rg42d3b5aa/providers/Microsoft.Sql/servers/myProjectsqlserveree7348a/administrators/ActiveDirectory
 
         var activeDirectory = new AzureNative.Sql.ServerAzureADAdministrator("activeDirectory", new AzureNative.Sql.ServerAzureADAdministratorArgs
         {
@@ -135,7 +240,7 @@ class AppStack : Stack
     private void SetupServicePlan()
     {
         // A plan to host the App Service
-        AppServicePlan = new Plan("Beinni-sp", new PlanArgs
+        AppServicePlan = new Plan("MyProject-sp", new PlanArgs
         {
             ResourceGroupName = ResourceGroup.Apply(t => t.Name),
             Kind = "App",
@@ -150,36 +255,15 @@ class AppStack : Stack
             },
         });
     }
-    private void SetKeyVaultAndSecrets()
+    private void SetSecrets()
     {
-        // Key Vault to store secrets
-        KeyVault = new KeyVault("vault", new KeyVaultArgs
-        {
-            ResourceGroupName = ResourceGroup.Apply(t => t.Name),
-            SkuName = "standard",
-            TenantId = TenantId,
-            AccessPolicies =
-            {
-                new KeyVaultAccessPolicyArgs
-                {
-                    TenantId = TenantId,
-                    // The current principal has to be granted permissions to Key Vault so that it can actually add and then remove
-                    // secrets to/from the Key Vault. Otherwise, 'pulumi up' and 'pulumi destroy' operations will fail.
-                    ObjectId = CurrentPricipal,
-                    SecretPermissions = {"delete", "get", "list", "set"},
-                }
-            },
-            Tags =
-            {
-                { "environment", StackName },
-            },
-        });
-
+        #region ConnectionString
         var connectionStringSecret = new Secret("ConnectionString", new SecretArgs
         {
             KeyVaultId = KeyVault.Id,
-            Value = Output.Format($"Server=tcp:{SqlServer.Name}.database.windows.net;Database={Database.Name};"),
+            Value = ConnectionStringWithPassword
         });
+        #endregion
 
         #region Encryption
         var stringEncryptionDefaultPassPhraseSecret = new Secret("DefaultPassPhrase", new SecretArgs
@@ -245,7 +329,7 @@ class AppStack : Stack
     {
         if (Deployment.Instance.StackName.ToLower() == "dev") //<<-- not sure if you should do this!
         {
-            Redis = new AzureNative.Cache.Redis("redisCacheBeinni", new AzureNative.Cache.RedisArgs
+            Redis = new AzureNative.Cache.Redis("redisCacheMyProject", new AzureNative.Cache.RedisArgs
             {
                 EnableNonSslPort = false,
                 Location = ResourceGroup.Apply(t => t.Location),
@@ -298,8 +382,8 @@ class AppStack : Stack
     }
     private void SetupAzureMediaService()
     {
-        var mediaServiceAccountName = "mediaservicebeinni";
-        var mediaService = new AzureNative.Media.MediaService("mediaservicebeinni", new AzureNative.Media.MediaServiceArgs
+        var mediaServiceAccountName = "mediaservicemyProject";
+        var mediaService = new AzureNative.Media.MediaService("mediaservicemyProject", new AzureNative.Media.MediaServiceArgs
         {
             AccountName = mediaServiceAccountName,
             Location = ResourceGroup.Apply(t => t.Location),
@@ -321,6 +405,24 @@ class AppStack : Stack
     }
     private void SetupIdentityService()
     {
+        // Question about this: https://pulumi-community.slack.com/archives/C01PF3E1B8V/p1641743241030600
+        // Maybe I don´t need this because of AppService -> SourceControl! But else make this work and add it to the API and Blazor AppServices!
+        // Deploy the zipped code to a blob https://www.pulumi.com/blog/level-up-your-azure-platform-as-a-service-applications-with-pulumi/#2-deployment-artifact
+        //var zippedCodeContainer = new Container("IdentityService-code", new ContainerArgs
+        //{
+        //    StorageAccountName = StorageAccountName,
+        //    ContainerAccessType = "private",
+        //});
+
+        //var blob = new Blob("IdentityServiceCodeBlob", new BlobArgs
+        //{
+        //    StorageAccountName = StorageAccountName,
+        //    StorageContainerName = zippedCodeContainer.Name,
+        //    Type = "Block",
+        //    Source = new FileArchive("../src/MyProject.IdentityServer/debug/net6.0/publish.zip") //<-- How do we zip it? Why is it set here? And what if prod/release?
+        //});
+        //IdentityCodeBlobEndpoint = blob.Url; // remove IdentityCodeBlobEndpoint if its only used here
+
         // The application hosted in App Service
         var identityApp = new AppService("IdentityService", new AppServiceArgs
         {
@@ -328,8 +430,14 @@ class AppStack : Stack
             AppServicePlanId = AppServicePlan.Id,
             // A system-assigned managed service identity to be used for authentication and authorization to the SQL Database and the Blob Storage
             Identity = new AppServiceIdentityArgs { Type = "SystemAssigned" },
+            SourceControl = new AppServiceSourceControlArgs
+            {
+                Branch = "dev", //TODO: If StackName == "production" then "master"
+                RepoUrl = "https://dev.azure.com/myProject/StreamWorks/_git/StreamWorks"
+            },
             AppSettings =
             {
+                { "WEBSITE_RUN_FROM_PACKAGE", IdentityCodeBlobEndpoint},
                 { "APPINSIGHTS_INSTRUMENTATIONKEY",InstrumentationKey},
                 { "APPLICATIONINSIGHTS_CONNECTION_STRING",InstrumentationKey.Apply(key => $"InstrumentationKey={key}")},
                 { "ApplicationInsightsAgent_EXTENSION_VERSION","~2"},
@@ -356,7 +464,8 @@ class AppStack : Stack
                 {
                     Name = "db",
                     Type = "SQLAzure",
-                    Value = ConnectionString.Apply(c=>c),
+                    //Value = ConnectionStringWithoutPassword.Apply(c=>c), //TODO: When issue solved add this back https://github.com/pulumi/pulumi-azure-native/issues/1416
+                    Value = Output.Format($"@Microsoft.KeyVault(SecretUri={ConnectionStringSecretUri})"),
                 },
             },
             SiteConfig = new AppServiceSiteConfigArgs
@@ -384,15 +493,16 @@ class AppStack : Stack
             SecretPermissions = { "get" },
         });
 
+        //TODO: Add back after https://github.com/pulumi/pulumi-azure-native/issues/1416 (see also https://pulumi-community.slack.com/archives/C84L4E3N1/p1641632588082900?thread_ts=1641199066.239100&cid=C84L4E3N1)
         // Make the App Service the admin of the SQL Server (double check if you want a more fine-grained security model in your real app)
-        var sqlAdmin = new ActiveDirectoryAdministrator("identityadmin", new ActiveDirectoryAdministratorArgs
-        {
-            ResourceGroupName = ResourceGroup.Apply(t => t.Name),
-            TenantId = TenantId,
-            ObjectId = principalId,
-            Login = "adadmin",
-            ServerName = SqlServer.Name,
-        });
+        //var sqlAdmin = new ActiveDirectoryAdministrator("identityadmin", new ActiveDirectoryAdministratorArgs
+        //{
+        //    ResourceGroupName = ResourceGroup.Apply(t => t.Name),
+        //    TenantId = TenantId,
+        //    ObjectId = principalId,
+        //    Login = "adadmin",
+        //    ServerName = SqlServer.Name,
+        //});
 
         // Add SQL firewall exceptions
         var firewallRules = identityApp.OutboundIpAddresses.Apply(
@@ -429,7 +539,11 @@ class AppStack : Stack
             AppServicePlanId = AppServicePlan.Id,
             // A system-assigned managed service identity to be used for authentication and authorization to the SQL Database and the Blob Storage
             Identity = new AppServiceIdentityArgs { Type = "SystemAssigned" },
-
+            SourceControl = new AppServiceSourceControlArgs
+            {
+                Branch = "dev", //TODO: If StackName == "production" then "master"
+                RepoUrl = "https://dev.azure.com/myProject/StreamWorks/_git/StreamWorks"
+            },
             AppSettings =
             {
                 { "APPINSIGHTS_INSTRUMENTATIONKEY",InstrumentationKey},
@@ -457,6 +571,7 @@ class AppStack : Stack
                 {
                     Name = "db",
                     Type = "SQLAzure",
+                    //Value = ConnectionStringWithoutPassword.Apply(c=>c), //TODO: When issue solved add this back https://github.com/pulumi/pulumi-azure-native/issues/1416
                     Value = Output.Format($"@Microsoft.KeyVault(SecretUri={ConnectionStringSecretUri})"),
                 },
             },
@@ -485,15 +600,16 @@ class AppStack : Stack
             SecretPermissions = { "get" },
         });
 
+        //TODO: Add back after https://github.com/pulumi/pulumi-azure-native/issues/1416
         // Make the App Service the admin of the SQL Server (double check if you want a more fine-grained security model in your real app)
-        var sqlAdmin = new ActiveDirectoryAdministrator("apiadmin", new ActiveDirectoryAdministratorArgs
-        {
-            ResourceGroupName = ResourceGroup.Apply(t => t.Name),
-            TenantId = TenantId,
-            ObjectId = principalId,
-            Login = "adadmin",
-            ServerName = SqlServer.Name,
-        });
+        //var sqlAdmin = new ActiveDirectoryAdministrator("apiadmin", new ActiveDirectoryAdministratorArgs
+        //{
+        //    ResourceGroupName = ResourceGroup.Apply(t => t.Name),
+        //    TenantId = TenantId,
+        //    ObjectId = principalId,
+        //    Login = "adadmin",
+        //    ServerName = SqlServer.Name,
+        //});
 
         // Grant access from App Service to the container in the storage
         var posterImagesBlobPermission = new Assignment("readposterblobpermission", new AssignmentArgs
@@ -534,7 +650,11 @@ class AppStack : Stack
             AppServicePlanId = AppServicePlan.Id,
             // A system-assigned managed service identity to be used for authentication and authorization to the SQL Database and the Blob Storage
             Identity = new AppServiceIdentityArgs { Type = "SystemAssigned" },
-
+            SourceControl = new AppServiceSourceControlArgs
+            {
+                Branch = "dev", //TODO: If StackName == "production" then "master"
+                RepoUrl = "https://dev.azure.com/myProject/StreamWorks/_git/StreamWorks"
+            },
             AppSettings =
             {
                 { "APPINSIGHTS_INSTRUMENTATIONKEY",InstrumentationKey},
@@ -566,6 +686,41 @@ class AppStack : Stack
         });
 
         this.PublicWebAppEndpoint = Output.Format($"https://{publicWebApp.DefaultSiteHostname}");
+
+        // CDN (do I need this?
+        var endpoint = new AzureNative.Cdn.Endpoint("public-web-cdn-ep", new AzureNative.Cdn.EndpointArgs
+        {
+            ResourceGroupName = ResourceGroup.Apply(t => t.Name),
+            ProfileName = CDNProfile.Name,
+            IsHttpAllowed = false,
+            IsHttpsAllowed = true,
+            OriginHostHeader = publicWebApp.DefaultSiteHostname,
+            Origins = new List<AzureNative.Cdn.Inputs.DeepCreatedOriginArgs> {
+                {
+                    new AzureNative.Cdn.Inputs.DeepCreatedOriginArgs { Name = "public-web", HostName = publicWebApp.DefaultSiteHostname }
+                }
+            }
+        });
+
+        PublicWebAppCDNEndpoint = Output.Format($"https://{endpoint.HostName}");
+
+        if (Deployment.Instance.StackName.ToLower() == "production")
+        {
+            // My custom domain question https://pulumi-community.slack.com/archives/C01PF3E1B8V/p1641648951021600
+            //TODO: Don´t I need this?  https://www.pulumi.com/registry/packages/azure-native/api-docs/appplatform/customdomain/
+            //var customDomain = new AzureNative.AppPlatform.CustomDomain("publicCustomDomain", new AzureNative.AppPlatform.CustomDomainArgs
+            //{
+            //    AppName = publicWebApp.Name,
+            //    DomainName = "myProject.is",
+            //    Properties = new AzureNative.AppPlatform.Inputs.CustomDomainPropertiesArgs
+            //    {
+            //        CertName = CertificateOrder.Name,
+            //        Thumbprint = CertificateOrder.SignedCertificateThumbprint, //There are other thumbprints on there.. no idea what to use (if any)!
+            //    },
+            //    ResourceGroupName = ResourceGroup.Apply(t => t.Name),
+            //    ServiceName = "???",
+            //});
+        }
     }
     private void SetupBlazorService()
     {
@@ -576,7 +731,11 @@ class AppStack : Stack
             AppServicePlanId = AppServicePlan.Id,
             // A system-assigned managed service identity to be used for authentication and authorization to the SQL Database and the Blob Storage
             Identity = new AppServiceIdentityArgs { Type = "SystemAssigned" },
-
+            SourceControl = new AppServiceSourceControlArgs
+            {
+                Branch = "dev", //TODO: If StackName == "production" then "master"
+                RepoUrl = "https://dev.azure.com/myProject/StreamWorks/_git/StreamWorks"
+            },
             AppSettings =
             {
                 //{"App:SelfUrl", Output.Format($"https://{this.???}")}, // is this even possible since it. Maybe its not correct in azure to have this config...
@@ -589,6 +748,10 @@ class AppStack : Stack
 
         this.BlazorEndpoint = Output.Format($"https://{blazorApp.DefaultSiteHostname}");
     }
+
+    public CertificateOrder CertificateOrder { get; set; }
+    public AzureNative.Web.Certificate WebCertificate { get; set; }
+    public AzureNative.Cdn.Profile CDNProfile { get; set; }
     public Database Database { get; set; }
     public SqlServer SqlServer { get; set; }
     public AzureNative.Cache.Redis Redis { get; set; }
@@ -596,6 +759,7 @@ class AppStack : Stack
     public KeyVault KeyVault { get; set; }
     public Plan AppServicePlan { get; set; }
 
+    // Do I need to have these as outputs? 
     [Output] public Output<AzureNative.Sql.ServerAzureADAdministrator> ServerAzureADAdministrator { get; set; }
     [Output] public Output<string> DefaultEncryptionPassPhraseUri { get; set; }
     [Output] public Output<string> FacebookAppIdUri { get; set; }
@@ -607,6 +771,7 @@ class AppStack : Stack
     [Output] public Output<string> StackName { get; set; }
     [Output] public Output<string> CurrentPricipal { get; set; }
     [Output] public Output<string> ConnectionString { get; set; }
+    [Output] public Output<string> ConnectionStringWithPassword { get; set; }
     [Output] public Output<string> ConnectionStringSecretUri { get; set; }
     [Output("currentSubscriptionId")]
     public Output<string> CurrentSubscriptionId { get; set; }
@@ -618,7 +783,9 @@ class AppStack : Stack
     [Output] public Output<string> TenantId { get; set; }
     [Output] public Output<ResourceGroup> ResourceGroup { get; set; }
     [Output] public Output<string> IdentityEndpoint { get; set; }
+    [Output] public Output<string> IdentityCodeBlobEndpoint { get; set; }
     [Output] public Output<string> ApiEndpoint { get; set; }
     [Output] public Output<string> PublicWebAppEndpoint { get; set; }
+    [Output] public Output<string> PublicWebAppCDNEndpoint { get; set; }
     [Output] public Output<string> BlazorEndpoint { get; set; }
 }

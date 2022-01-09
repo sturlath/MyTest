@@ -1,0 +1,56 @@
+# A minimal Azure Pipelines build configuration file for running
+# Pulumi apps that use the dotnet runtime and the Azure Native
+# Nuget package.
+
+trigger:
+  batch: true
+  branches:
+    include:
+      - Development
+  paths:
+    include:
+      - "**/*"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  solution: "**/*.sln"
+  buildPlatform: "Any CPU"
+  buildConfiguration: "Release"
+
+jobs:
+  - job: infrastructure
+    steps:
+      - task: NuGetToolInstaller@1
+
+      # SHOULD I BUILD AND PUBLISH MY CODE FIRST?
+
+      - task: Pulumi@1
+        condition: or(eq(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.Reason'], 'Manual'))
+        inputs:
+           # Using a service connection is optional. Specify build variables for your pipeline or link variable groups
+          # that contain the necessary environment variables needed by the Pulumi provider your Pulumi app uses.
+          azureSubscription: "azServiceConnection"
+          # Pulumi will automatically build/restore the dotnet project.
+          # Unless you are using a pre-built binary.
+          command: "preview"
+          stack: "$(StackName)"
+          cwd: "./infra"
+      - task: Pulumi@1
+        condition: or(eq(variables['Build.Reason'], 'IndividualCI'), eq(variables['Build.Reason'], 'BatchedCI'))
+        inputs:
+          # To use an Azure Service Connection, un-comment the following line.
+          azureSubscription: "azServiceConnection"
+          # Pulumi will automatically build/restore the dotnet project.
+          # Unless you are using a pre-built binary.
+          command: "up"
+          stack: "$(StackName)"
+          args: '--yes'
+          cwd: "./infra"
+      - script: |
+          echo "##vso[task.setvariable variable=resourceGroupName;isOutput=true]$(pulumi stack output resourceGroupName)"
+          echo "##vso[task.setvariable variable=storageAccountName;isOutput=true]$(pulumi stack output storageAccountName)"
+          echo "##vso[task.setvariable variable=containerName;isOutput=true]$(pulumi stack output containerName)"      
+        displayName: 'Set stack outputs as variables'
+        name: 'pulumi'
