@@ -13,6 +13,10 @@ config:
     secure: xxxx
   IBeinni:TwilioSms-AuthToken:
     secure: xxxx
+  IBeinni:WebCertificate:
+    secure: xxxx
+  IBeinni:WildCardCertSecret:
+    secure: xxxx
   IBeinni:dbPassword:
     secure: xxxx
   IBeinni:location: North Europe
